@@ -34,7 +34,7 @@ cargo build --release
 
 ## ▶️ Usage
 
-Run with default delegate address ([voteron.eth](etherscan.io/address/0x6D8D914205bB14104c0f95BfaDb4B1680EF60CCC)):
+Run with default delegate address ([voteron.eth](https://etherscan.io/address/0x6D8D914205bB14104c0f95BfaDb4B1680EF60CCC)):
 
 ```bash
 cargo run --release -- --vote-id 180
