@@ -22,7 +22,7 @@ Simple CLI application written in Rust, using Alloy, to fetch and display Lido (
 Clone this repository and navigate to the directory:
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/TheDZhon/ldo_delegate_vp.git
 cd delegate_voting_power
 ```
 
@@ -63,4 +63,3 @@ Licensed under the [MIT License](LICENSE).
 ---
 
 Made with 🦀 using Rust and Alloy.
-
