@@ -1,40 +1,34 @@
-# 🔷 LDO Delegate Voting Power
+# LDO Delegate Voting Power
 
-![Rust](https://img.shields.io/badge/rust-1.77.2-brightgreen.svg)
-![Alloy](https://img.shields.io/badge/alloy-0.12.6-blue.svg)
+![Rust](https://img.shields.io/badge/rust-1.88%2B-brightgreen.svg)
+![Alloy](https://img.shields.io/badge/alloy-1.x-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-Simple CLI application written in Rust, using Alloy, to fetch and display Lido (LDO) on-chain voting power for a selected delegate and specific vote ID.
+A small Rust CLI (built on [Alloy](https://github.com/alloy-rs/alloy)) that fetches delegated voters
+for a Lido delegate and prints addresses sorted by LDO voting power at a specific vote ID.
 
-## 🚀 Key Features
+## Key features
 
-- Fetch **all delegated voters** for a specified delegate address.
-- Calculate and display **voting power** clearly, in a human-readable format (LDO).
-- Sort addresses by voting power in descending order.
-- Easy-to-use command-line interface.
+- Fetch **all delegated voters** for a delegate address.
+- Query **voting power** at a specific vote ID (delegate + delegated voters).
+- Sort output by voting power (descending).
+- Avoid leaking secrets by logging a **redacted RPC host** (no query params / credentials).
 
-## ⚙️ Prerequisites
+## Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (stable, v1.77.2 or later recommended)
+- [Rust toolchain](https://rustup.rs/) (**Rust 1.88+**; required by Alloy 1.x)
 
-## 📥 Installation
-
-Clone this repository and navigate to the directory:
+## Installation
 
 ```bash
 git clone https://github.com/TheDZhon/ldo_delegate_vp.git
-cd delegate_voting_power
-```
-
-Build the project:
-
-```bash
+cd ldo_delegate_vp
 cargo build --release
 ```
 
-## ▶️ Usage
+## Usage
 
-Run with default delegate address ([voteron.eth](https://etherscan.io/address/0x6D8D914205bB14104c0f95BfaDb4B1680EF60CCC)):
+Run with the default delegate address ([voteron.eth](https://etherscan.io/address/0x6D8D914205bB14104c0f95BfaDb4B1680EF60CCC)):
 
 ```bash
 cargo run --release -- --vote-id 180
@@ -46,20 +40,32 @@ Run with a custom delegate address:
 cargo run --release -- --vote-id 180 --delegate-address 0xYourAddressHere
 ```
 
-### Environment Variables
+### RPC configuration
 
-You can optionally set the Ethereum RPC URL via `.env`:
+You can pass an RPC URL directly or set it via environment variable / `.env`:
 
 ```bash
-RPC_URL=https://your.rpc.provider
+# flag
+cargo run --release -- --vote-id 180 --rpc-url https://your.rpc.provider
+
+# env var (also works via `.env`)
+export RPC_URL=https://your.rpc.provider
+cargo run --release -- --vote-id 180
 ```
 
-(Default: `https://eth.drpc.org`)
+### Other options
 
-## 📋 License
+- `--contract-address <ADDRESS>`: override the Lido Voting contract address
+- `--page-size <N>`: page size for delegated voter fetch (default: 100)
+- `--chunk-size <N>`: chunk size for voting power queries (default: 100)
+- `--quiet`: suppress progress logs
+
+## Tests
+
+```bash
+cargo test
+```
+
+## License
 
 Licensed under the [MIT License](LICENSE).
-
----
-
-Made with 🦀 using Rust and Alloy.

@@ -1,11 +1,12 @@
 use alloy_network::Ethereum;
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{Address, U256};
 use alloy_provider::RootProvider;
 use alloy_sol_types::sol;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use dotenvy::dotenv;
-use std::{env, sync::Arc};
+use ldo_delegate_vp::{format_units, redact_rpc_url, unique_preserve_order};
+use std::{iter, sync::Arc};
 
 sol! {
     #[sol(rpc)]
@@ -21,104 +22,133 @@ struct Args {
     #[arg(short, long)]
     vote_id: u64,
 
-    #[arg(short, long, default_value = "0x6D8D914205bB14104c0f95BfaDb4B1680EF60CCC")]
-    delegate_address: String,
+    #[arg(
+        short,
+        long,
+        default_value = "0x6D8D914205bB14104c0f95BfaDb4B1680EF60CCC"
+    )]
+    delegate_address: Address,
+
+    /// Ethereum RPC URL (can also be provided via `RPC_URL` / `.env`).
+    #[arg(long, env = "RPC_URL", default_value = "https://eth.drpc.org")]
+    rpc_url: String,
+
+    /// Lido Voting contract address (Ethereum mainnet).
+    #[arg(long, default_value = "0x2e59A20f205bB85a89C53f1936454680651E618e")]
+    contract_address: Address,
+
+    /// Page size for `getDelegatedVoters` calls.
+    #[arg(long, default_value_t = 100)]
+    page_size: usize,
+
+    /// Chunk size for `getVotingPowerMultipleAtVote` calls.
+    #[arg(long, default_value_t = 100)]
+    chunk_size: usize,
+
+    /// Suppress progress logging (results still printed).
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    let Args { vote_id, delegate_address } = Args::parse();
+    let args = Args::parse();
 
-    let rpc_url = env::var("RPC_URL").unwrap_or("https://eth.drpc.org".into());
-    println!("RPC URL: {}", rpc_url);
+    if args.page_size == 0 {
+        anyhow::bail!("--page-size must be >= 1");
+    }
+    if args.chunk_size == 0 {
+        anyhow::bail!("--chunk-size must be >= 1");
+    }
 
-    let provider = Arc::new(RootProvider::<Ethereum>::new_http(rpc_url.parse()?));
+    if !args.quiet {
+        println!("RPC: {}", redact_rpc_url(&args.rpc_url));
+        println!("Contract: {}", args.contract_address);
+        println!("Delegate: {}", args.delegate_address);
+    }
 
-    let contract_address = address!("2e59A20f205bB85a89C53f1936454680651E618e");
-    let delegate_address: Address = delegate_address.parse()?;
-    let contract = LidoVoting::new(contract_address, provider);
+    let provider = Arc::new(RootProvider::<Ethereum>::new_http(
+        args.rpc_url.parse().context("invalid RPC URL")?,
+    ));
+    let contract = LidoVoting::new(args.contract_address, provider);
 
-    let vote_id = U256::from(vote_id);
-    let mut delegated_voters = vec![];
+    let vote_id = U256::from(args.vote_id);
+    let mut delegated_voters: Vec<Address> = Vec::new();
     let mut offset = U256::ZERO;
-    let limit = U256::from(100);
+    let limit = U256::from(args.page_size as u64);
 
-    println!("Fetching delegated voters for delegate {}...", delegate_address);
+    if !args.quiet {
+        println!("Fetching delegated voters...");
+    }
     loop {
-        let voters = contract
-            .getDelegatedVoters(delegate_address, offset, limit)
+        let voters: Vec<Address> = contract
+            .getDelegatedVoters(args.delegate_address, offset, limit)
             .call()
-            .await?
-            .voters;
+            .await
+            .context("getDelegatedVoters RPC call failed")?;
 
         if voters.is_empty() {
             break;
         }
 
-        println!("Fetched {} voters", voters.len());
-        delegated_voters.extend(voters.clone());
+        let fetched = voters.len();
+        if !args.quiet {
+            println!("Fetched {fetched} voters");
+        }
+        delegated_voters.extend(voters);
 
-        if voters.len() < limit.to::<usize>() {
+        if fetched < args.page_size {
             break;
         }
 
         offset += limit;
     }
 
-    println!("Total delegated voters fetched: {}", delegated_voters.len());
+    let addresses = unique_preserve_order(
+        iter::once(args.delegate_address).chain(delegated_voters.into_iter()),
+    );
+    if !args.quiet {
+        println!("Unique addresses to query: {}", addresses.len());
+        println!("Calculating voting power at vote ID {}...", args.vote_id);
+    }
 
-    let mut addresses = vec![delegate_address];
-    addresses.extend(delegated_voters);
-
-    let mut voting_power_map = vec![];
-
-    println!("\n✅ Calculating voting power at vote ID {}...", vote_id);
-    for chunk in addresses.chunks(100) {
-        let balances = contract
+    let mut voting_power_map: Vec<(Address, U256)> = Vec::with_capacity(addresses.len());
+    for chunk in addresses.chunks(args.chunk_size) {
+        let balances: Vec<U256> = contract
             .getVotingPowerMultipleAtVote(vote_id, chunk.to_vec())
             .call()
-            .await?
-            .balances;
+            .await
+            .context("getVotingPowerMultipleAtVote RPC call failed")?;
 
-        voting_power_map.extend(chunk.iter().zip(balances.iter()).map(|(addr, power)| (*addr, *power)));
+        anyhow::ensure!(
+            balances.len() == chunk.len(),
+            "voting power response length mismatch (got {}, expected {})",
+            balances.len(),
+            chunk.len()
+        );
+
+        voting_power_map.extend(chunk.iter().copied().zip(balances.into_iter()));
     }
 
     // Sort by voting power descending
-    voting_power_map.sort_by(|a, b| b.1.cmp(&a.1));
+    voting_power_map.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    println!("\n📌 Addresses sorted by Voting Power (Descending):");
+    println!("\nAddresses sorted by Voting Power (Descending):");
     for (address, power) in &voting_power_map {
         println!(
-            "Address: {:?}, Voting power: {} LDO",
-            address,
+            "Address: {address}, Voting power: {} LDO",
             format_units(*power, 18)
         );
     }
 
-    let total_voting_power: U256 = voting_power_map.iter().map(|(_, power)| power).sum();
+    let total_voting_power: U256 = voting_power_map.iter().map(|(_, power)| *power).sum();
 
     println!(
-        "\n🚀 Total voting power at vote ID {}: {} LDO",
-        vote_id,
+        "\nTotal voting power at vote ID {}: {} LDO",
+        args.vote_id,
         format_units(total_voting_power, 18)
     );
 
     Ok(())
-}
-
-// Utility function clearly formatting U256 into readable decimals
-fn format_units(value: U256, decimals: u32) -> String {
-    let factor = U256::from(10).pow(U256::from(decimals));
-    let whole = value / factor;
-    let fractional = value % factor;
-
-    if fractional.is_zero() {
-        whole.to_string()
-    } else {
-        let fractional_str = format!("{:0>width$}", fractional, width = decimals as usize)
-            .trim_end_matches('0')
-            .to_string();
-        format!("{}.{}", whole, fractional_str)
-    }
 }
