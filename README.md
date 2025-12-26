@@ -94,6 +94,21 @@ cargo run --release -- --vote-id 180
 
 ## Development
 
+### Setup
+
+Install git hooks to run CI checks before each commit:
+
+```bash
+./scripts/install-hooks.sh
+```
+
+This will run the following checks on every `git commit`:
+- `cargo fmt -- --check` (formatting)
+- `cargo clippy --all-targets --all-features -- -D warnings` (lints)
+- `cargo test --all-targets --all-features` (tests)
+
+To skip hooks temporarily: `git commit --no-verify`
+
 ### Running Tests
 
 Run the unit tests to ensure everything is working correctly:
