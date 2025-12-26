@@ -5,7 +5,8 @@ use alloy_sol_types::sol;
 use anyhow::{Context, Result};
 use clap::Parser;
 use dotenvy::dotenv;
-use ldo_delegate_vp::{format_units, redact_rpc_url, unique_preserve_order};
+use futures::stream::{self, StreamExt};
+use ldo_delegate_vp::{format_units, format_units_human, redact_rpc_url, unique_preserve_order};
 use std::{iter, sync::Arc};
 
 sol! {
@@ -13,14 +14,16 @@ sol! {
     interface LidoVoting {
         function getDelegatedVoters(address _delegate, uint256 _offset, uint256 _limit) external view returns (address[] voters);
         function getVotingPowerMultipleAtVote(uint256 _voteId, address[] _voters) external view returns (uint256[] balances);
+        function getVotingPowerMultiple(address[] _voters) external view returns (uint256[] balances);
     }
 }
 
 #[derive(Parser)]
 #[command(version, about = "Fetch delegated voters sorted by voting power")]
 struct Args {
+    /// Vote ID to query historical voting power at. If omitted, queries current voting power.
     #[arg(short, long)]
-    vote_id: u64,
+    vote_id: Option<u64>,
 
     #[arg(
         short,
@@ -45,6 +48,10 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     chunk_size: usize,
 
+    /// Concurrent requests for voting power fetching.
+    #[arg(long, default_value_t = 5)]
+    concurrency: usize,
+
     /// Suppress progress logging (results still printed).
     #[arg(long)]
     quiet: bool,
@@ -61,11 +68,14 @@ async fn main() -> Result<()> {
     if args.chunk_size == 0 {
         anyhow::bail!("--chunk-size must be >= 1");
     }
+    if args.concurrency == 0 {
+        anyhow::bail!("--concurrency must be >= 1");
+    }
 
     if !args.quiet {
-        println!("RPC: {}", redact_rpc_url(&args.rpc_url));
-        println!("Contract: {}", args.contract_address);
-        println!("Delegate: {}", args.delegate_address);
+        println!("🔗 RPC: {}", redact_rpc_url(&args.rpc_url));
+        println!("📜 Contract: {}", args.contract_address);
+        println!("👤 Delegate: {}", args.delegate_address);
     }
 
     let provider = Arc::new(RootProvider::<Ethereum>::new_http(
@@ -73,13 +83,13 @@ async fn main() -> Result<()> {
     ));
     let contract = LidoVoting::new(args.contract_address, provider);
 
-    let vote_id = U256::from(args.vote_id);
+    let vote_id = args.vote_id.map(U256::from);
     let mut delegated_voters: Vec<Address> = Vec::new();
     let mut offset = U256::ZERO;
     let limit = U256::from(args.page_size as u64);
 
     if !args.quiet {
-        println!("Fetching delegated voters...");
+        println!("\n📥 Fetching delegated voters...");
     }
     loop {
         let voters: Vec<Address> = contract
@@ -94,7 +104,7 @@ async fn main() -> Result<()> {
 
         let fetched = voters.len();
         if !args.quiet {
-            println!("Fetched {fetched} voters");
+            println!("   ✓ Fetched {} voters", fetched);
         }
         delegated_voters.extend(voters);
 
@@ -109,46 +119,107 @@ async fn main() -> Result<()> {
         iter::once(args.delegate_address).chain(delegated_voters.into_iter()),
     );
     if !args.quiet {
-        println!("Unique addresses to query: {}", addresses.len());
-        println!("Calculating voting power at vote ID {}...", args.vote_id);
+        println!("   📊 Unique addresses: {}", addresses.len());
+        match vote_id {
+            Some(id) => println!("\n⏳ Calculating voting power at vote #{}...", id),
+            None => println!("\n⏳ Calculating current voting power..."),
+        }
     }
 
     let mut voting_power_map: Vec<(Address, U256)> = Vec::with_capacity(addresses.len());
-    for chunk in addresses.chunks(args.chunk_size) {
-        let balances: Vec<U256> = contract
-            .getVotingPowerMultipleAtVote(vote_id, chunk.to_vec())
-            .call()
-            .await
-            .context("getVotingPowerMultipleAtVote RPC call failed")?;
 
-        anyhow::ensure!(
-            balances.len() == chunk.len(),
-            "voting power response length mismatch (got {}, expected {})",
-            balances.len(),
-            chunk.len()
-        );
+    let mut stream = stream::iter(addresses.chunks(args.chunk_size))
+        .map(|chunk| {
+            let contract = contract.clone();
+            let chunk = chunk.to_vec();
+            async move {
+                let balances: Vec<U256> = match vote_id {
+                    Some(id) => {
+                        contract
+                            .getVotingPowerMultipleAtVote(id, chunk.clone())
+                            .call()
+                            .await
+                            .context("getVotingPowerMultipleAtVote RPC call failed")?
+                    }
+                    None => {
+                        contract
+                            .getVotingPowerMultiple(chunk.clone())
+                            .call()
+                            .await
+                            .context("getVotingPowerMultiple RPC call failed")?
+                    }
+                };
 
-        voting_power_map.extend(chunk.iter().copied().zip(balances.into_iter()));
+                anyhow::ensure!(
+                    balances.len() == chunk.len(),
+                    "voting power response length mismatch (got {}, expected {})",
+                    balances.len(),
+                    chunk.len()
+                );
+
+                Ok::<_, anyhow::Error>(chunk.into_iter().zip(balances.into_iter()).collect::<Vec<_>>())
+            }
+        })
+        .buffer_unordered(args.concurrency);
+
+    while let Some(result) = stream.next().await {
+        let pairs = result?;
+        voting_power_map.extend(pairs);
     }
 
     // Sort by voting power descending
     voting_power_map.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    println!("\nAddresses sorted by Voting Power (Descending):");
-    for (address, power) in &voting_power_map {
-        println!(
-            "Address: {address}, Voting power: {} LDO",
-            format_units(*power, 18)
-        );
+    // Separate non-zero and zero voting power addresses
+    let (with_power, without_power): (Vec<_>, Vec<_>) = voting_power_map
+        .iter()
+        .partition(|(_, power)| !power.is_zero());
+
+    let total_voting_power: U256 = with_power.iter().map(|(_, power)| *power).sum();
+
+    // Print header
+    println!();
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    match args.vote_id {
+        Some(id) => println!("🗳️  VOTING POWER AT VOTE #{}", id),
+        None => println!("🗳️  CURRENT VOTING POWER"),
+    }
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Print active voters
+    if !with_power.is_empty() {
+        println!();
+        println!("💎 ACTIVE VOTERS ({} addresses)", with_power.len());
+        println!("────────────────────────────────────────────────────────────────────────────────");
+        for (i, (address, power)) in with_power.iter().enumerate() {
+            let power_str = format_units_human(*power, 18);
+            println!(
+                "  #{:<3}  {}  {:>22} LDO",
+                i + 1,
+                address,
+                power_str
+            );
+        }
     }
 
-    let total_voting_power: U256 = voting_power_map.iter().map(|(_, power)| *power).sum();
+    // Print inactive voters summary
+    if !without_power.is_empty() {
+        println!();
+        println!("💤 INACTIVE: {} addresses with 0 LDO", without_power.len());
+    }
 
+    // Print totals
+    println!();
+    println!("════════════════════════════════════════════════════════════════════════════════");
     println!(
-        "\nTotal voting power at vote ID {}: {} LDO",
-        args.vote_id,
+        "🏆 TOTAL VOTING POWER:  {} LDO",
+        format_units_human(total_voting_power, 18)
+    );
+    println!(
+        "📊 Full precision:      {} LDO",
         format_units(total_voting_power, 18)
     );
+    println!("════════════════════════════════════════════════════════════════════════════════");
 
     Ok(())
 }
