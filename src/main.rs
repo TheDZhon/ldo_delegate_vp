@@ -134,20 +134,16 @@ async fn main() -> Result<()> {
             let chunk = chunk.to_vec();
             async move {
                 let balances: Vec<U256> = match vote_id {
-                    Some(id) => {
-                        contract
-                            .getVotingPowerMultipleAtVote(id, chunk.clone())
-                            .call()
-                            .await
-                            .context("getVotingPowerMultipleAtVote RPC call failed")?
-                    }
-                    None => {
-                        contract
-                            .getVotingPowerMultiple(chunk.clone())
-                            .call()
-                            .await
-                            .context("getVotingPowerMultiple RPC call failed")?
-                    }
+                    Some(id) => contract
+                        .getVotingPowerMultipleAtVote(id, chunk.clone())
+                        .call()
+                        .await
+                        .context("getVotingPowerMultipleAtVote RPC call failed")?,
+                    None => contract
+                        .getVotingPowerMultiple(chunk.clone())
+                        .call()
+                        .await
+                        .context("getVotingPowerMultiple RPC call failed")?,
                 };
 
                 anyhow::ensure!(
@@ -157,7 +153,12 @@ async fn main() -> Result<()> {
                     chunk.len()
                 );
 
-                Ok::<_, anyhow::Error>(chunk.into_iter().zip(balances.into_iter()).collect::<Vec<_>>())
+                Ok::<_, anyhow::Error>(
+                    chunk
+                        .into_iter()
+                        .zip(balances.into_iter())
+                        .collect::<Vec<_>>(),
+                )
             }
         })
         .buffer_unordered(args.concurrency);
@@ -190,15 +191,12 @@ async fn main() -> Result<()> {
     if !with_power.is_empty() {
         println!();
         println!("💎 ACTIVE VOTERS ({} addresses)", with_power.len());
-        println!("────────────────────────────────────────────────────────────────────────────────");
+        println!(
+            "────────────────────────────────────────────────────────────────────────────────"
+        );
         for (i, (address, power)) in with_power.iter().enumerate() {
             let power_str = format_units_human(*power, 18);
-            println!(
-                "  #{:<3}  {}  {:>22} LDO",
-                i + 1,
-                address,
-                power_str
-            );
+            println!("  #{:<3}  {}  {:>22} LDO", i + 1, address, power_str);
         }
     }
 
